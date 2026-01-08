@@ -1,0 +1,9 @@
+[submodule "rusty_v8"]
+	path = rusty_v8
+	url = https://github.com/taskylizard/rusty_v8
+[submodule "v8"]
+	path = v8
+	url = https://github.com/denoland/v8
+[submodule "deno_core"]
+	path = deno_core
+	url = https://github.com/taskylizard/deno_core

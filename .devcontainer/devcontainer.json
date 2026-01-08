@@ -1,0 +1,16 @@
+{
+	"name": "Rust",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+
+	"customizations": {
+		"C_cpp.default.compilerPath": "/usr/bin/clang++",
+		"C_Cpp.default.includePath": [
+			"/usr/include/c++/9",
+			"/usr/include/c++/9/x86_64-linux-gnu",
+			"/usr/include",
+			"/usr/local/include"
+		]
+	}
+}
