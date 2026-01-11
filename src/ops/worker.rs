@@ -1,11 +1,24 @@
 /// Worker messaging ops - available in worker isolates for communication
 use deno_core::{op2, OpState, Extension};
 use tokio::sync::mpsc;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use crate::ops::sandbox::IsolateMessage;
+use crate::pool::HostToWorkerMessage;
+use serde::{Deserialize, Serialize};
 
 /// Global counter for WebSocket connection IDs
 static NEXT_WS_CONN_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// Message received from host
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostMessage {
+    pub event: String,
+    pub data: serde_json::Value,
+}
 
 /// Send a message from worker to main
 #[op2]
@@ -96,6 +109,33 @@ pub fn op_worker_websocket_close(
     Ok(())
 }
 
+/// Receive a message from the host (async, waits for message)
+/// This is the key op that allows workers to receive messages during their event loop
+#[op2(async)]
+#[serde]
+pub async fn op_worker_recv(
+    state: Rc<RefCell<OpState>>,
+) -> Result<Option<HostMessage>, deno_core::error::CoreError> {
+    // Get the Arc<Mutex<Receiver>> from OpState
+    let receiver = {
+        let state_borrow = state.borrow();
+        // Use borrow() which panics if not found - helps debug type mismatches
+        state_borrow.borrow::<Arc<Mutex<mpsc::UnboundedReceiver<HostToWorkerMessage>>>>().clone()
+    };
+
+    // Lock the receiver and wait for a message
+    let mut rx = receiver.lock().await;
+
+    // Wait for a message (this properly yields to the event loop)
+    match rx.recv().await {
+        Some(msg) => Ok(Some(HostMessage {
+            event: msg.event,
+            data: msg.data,
+        })),
+        None => Ok(None), // Channel closed
+    }
+}
+
 deno_core::extension!(
     worker_messaging,
     ops = [
@@ -103,6 +143,7 @@ deno_core::extension!(
         op_worker_websocket_open,
         op_worker_websocket_send,
         op_worker_websocket_close,
+        op_worker_recv,
     ],
     esm = [dir "src/js", "bootstrap_worker.js"],
 );

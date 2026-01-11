@@ -151,6 +151,41 @@ globalThis.NETWORK = {
   __dispatchEvent,
 };
 
+// Start the host message receiver loop
+// This is called by Rust after OpState is populated
+let __hostMessageLoopStarted = false;
+
+function __startHostMessageLoop() {
+  if (__hostMessageLoopStarted) return;
+  __hostMessageLoopStarted = true;
+
+  (async function hostMessageLoop() {
+    while (true) {
+      try {
+        // Wait for a message from the host (this is async and yields to the event loop)
+        const message = await ops.op_worker_recv();
+
+        if (message === null) {
+          // Channel closed, stop the loop
+          break;
+        }
+
+        // Dispatch the event to registered handlers
+        __dispatchEvent(message.event, message.data);
+      } catch (e) {
+        // Use internal console for error reporting
+        internalConsole.Console.prototype.error.call(
+          internalConsole.console,
+          'Error in host message loop:',
+          e
+        );
+      }
+    }
+  })();
+}
+
+globalThis.__startHostMessageLoop = __startHostMessageLoop;
+
 // Define all global web APIs (but NO network APIs)
 const globalProperties = [
   // Abort APIs
@@ -284,8 +319,15 @@ class WorkerWebSocket extends EventTarget {
   static CLOSED = 3;
 
   #connId = null;
-  #readyState = 0; // CONNECTING
+  #readyState = WorkerWebSocket.CONNECTING;
   #url = '';
+  #binaryType = 'blob'; // Default per spec
+
+  // Standard callback properties
+  onopen = null;
+  onmessage = null;
+  onclose = null;
+  onerror = null;
 
   constructor(url) {
     super();
@@ -299,49 +341,95 @@ class WorkerWebSocket extends EventTarget {
     webSocketRegistry.set(this.#connId, this);
   }
 
+  // Internal handlers called by worker
   _handleOpen() {
     this.#readyState = WorkerWebSocket.OPEN;
-    this.dispatchEvent(new Event('open'));
+
+    const event = new Event('open');
+    this.dispatchEvent(event);
+    if (typeof this.onopen === 'function') this.onopen(event);
   }
 
   _handleMessage(data) {
     if (this.#readyState === WorkerWebSocket.OPEN) {
-      this.dispatchEvent(new MessageEvent('message', { data }));
+      let messageData = data;
+      if (this.#binaryType === 'arraybuffer' && typeof data !== 'string') {
+        messageData = data.buffer || data;
+      }
+      const event = new MessageEvent('message', { data: messageData });
+      this.dispatchEvent(event);
+      if (typeof this.onmessage === 'function') this.onmessage(event);
     }
   }
 
-  _handleClose(code, reason) {
+  _handleClose(code = 1000, reason = '') {
     this.#readyState = WorkerWebSocket.CLOSED;
-    this.dispatchEvent(new CloseEvent('close', { code, reason }));
-    // Cleanup: remove from registry
+
+    const event = new CloseEvent('close', { code, reason });
+    this.dispatchEvent(event);
+    if (typeof this.onclose === 'function') this.onclose(event);
+
     webSocketRegistry.delete(this.#connId);
   }
 
   _handleError(message) {
-    this.dispatchEvent(new ErrorEvent('error', { message }));
+    const event = new ErrorEvent('error', { message });
+    this.dispatchEvent(event);
+    if (typeof this.onerror === 'function') this.onerror(event);
   }
 
   send(data) {
     if (this.#readyState !== WorkerWebSocket.OPEN) {
       throw new Error('WebSocket is not open');
     }
-    ops.op_worker_websocket_send(this.#connId, String(data));
+
+    if (typeof data === 'string') {
+      ops.op_worker_websocket_send(this.#connId, data);
+    } else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+      ops.op_worker_websocket_send(this.#connId, data);
+    } else if (data instanceof Blob) {
+      data.arrayBuffer().then(buffer => {
+        ops.op_worker_websocket_send(this.#connId, buffer);
+      });
+    } else {
+      throw new TypeError('Unsupported data type for WebSocket.send()');
+    }
   }
 
   close(code = 1000, reason = '') {
-    if (this.#readyState >= WorkerWebSocket.CLOSING) {
-      return;
-    }
+    if (this.#readyState >= WorkerWebSocket.CLOSING) return;
+
     this.#readyState = WorkerWebSocket.CLOSING;
-    ops.op_worker_websocket_close(this.#connId);
+    ops.op_worker_websocket_close(this.#connId, code, reason);
   }
 
+  // Properties
   get readyState() {
     return this.#readyState;
   }
 
   get url() {
     return this.#url;
+  }
+
+  get binaryType() {
+    return this.#binaryType;
+  }
+
+  set binaryType(type) {
+    if (type !== 'blob' && type !== 'arraybuffer') {
+      throw new SyntaxError('binaryType must be "blob" or "arraybuffer"');
+    }
+    this.#binaryType = type;
+  }
+
+  // Spec placeholders
+  get extensions() {
+    return ''; // Could be implemented if needed
+  }
+
+  get protocol() {
+    return ''; // Could be implemented if needed
   }
 }
 

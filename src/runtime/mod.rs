@@ -81,10 +81,12 @@ pub fn create_runtime() -> JsRuntime {
 /// # Arguments
 /// * `isolate_id` - Unique identifier for this isolate
 /// * `message_sender` - Channel for sending messages to host
+/// * `host_message_receiver` - Channel for receiving messages from host
 /// * `memory_limit_bytes` - Memory limit in bytes (0 = no limit)
 pub fn create_worker_runtime(
     isolate_id: usize,
     message_sender: tokio::sync::mpsc::UnboundedSender<(usize, crate::ops::sandbox::IsolateMessage)>,
+    host_message_receiver: tokio::sync::mpsc::UnboundedReceiver<crate::pool::HostToWorkerMessage>,
     memory_limit_bytes: usize,
 ) -> JsRuntime {
     // Create isolated blob store for this worker
@@ -117,6 +119,10 @@ pub fn create_worker_runtime(
     // Store isolate ID and message sender in OpState for worker ops
     runtime.op_state().borrow_mut().put(isolate_id);
     runtime.op_state().borrow_mut().put(message_sender);
+    // Store host message receiver wrapped in Arc<Mutex> for async access
+    runtime.op_state().borrow_mut().put(
+        std::sync::Arc::new(tokio::sync::Mutex::new(host_message_receiver))
+    );
 
     runtime
 }

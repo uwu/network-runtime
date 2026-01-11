@@ -249,14 +249,9 @@ class Isolate {
     if (this.#destroyed) {
       throw new Error(`Cannot send to destroyed isolate #${this.#id}`);
     }
-    // Directly execute code to dispatch the event in the worker
-    const dataJson = JSON.stringify(data);
-    const dispatchCode = `
-      if (globalThis.NETWORK && globalThis.NETWORK.__dispatchEvent) {
-        globalThis.NETWORK.__dispatchEvent(${JSON.stringify(event)}, ${dataJson});
-      }
-    `;
-    ops.op_sandbox_execute(this.#id, dispatchCode);
+    // Send via channel - this is non-blocking and processed within the worker's event loop
+    // This fixes the deadlock that occurred when using op_sandbox_execute
+    ops.op_sandbox_send_to_isolate(this.#id, event, data);
   }
 
   /**

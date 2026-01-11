@@ -107,6 +107,26 @@ pub fn op_sandbox_shutdown(
     pool.shutdown();
 }
 
+/// Send a message to an isolate via the channel (non-blocking, processed within event loop)
+/// This is the fix for the deadlock - messages are sent via channel and received asynchronously
+#[op2]
+pub fn op_sandbox_send_to_isolate(
+    state: Rc<RefCell<OpState>>,
+    #[number] isolate_id: usize,
+    #[string] event: String,
+    #[serde] data: serde_json::Value,
+) -> Result<(), deno_core::error::CoreError> {
+    let pool = {
+        let state_borrow = state.borrow();
+        state_borrow.borrow::<Rc<JsWorkerPool>>().clone()
+    };
+
+    pool.send_to_isolate(isolate_id, event, data)
+        .map_err(|e| deno_core::error::CoreError::from(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+    Ok(())
+}
+
 
 /// Message with isolate ID for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]

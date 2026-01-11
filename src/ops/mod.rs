@@ -20,6 +20,7 @@ deno_core::extension!(
         sandbox::op_sandbox_shutdown,
         sandbox::op_sandbox_poll_messages,
         sandbox::op_sandbox_poll_system_events,
+        sandbox::op_sandbox_send_to_isolate,
         util::op_tls_peer_certificate,
         util::op_set_raw,
     ],

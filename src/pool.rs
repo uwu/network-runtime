@@ -11,6 +11,13 @@ use crate::runtime;
 use crate::ops::sandbox::{IsolateMessage, SystemEvent};
 use crate::{vlog, vlog_err};
 
+/// Message sent from host to worker isolate
+#[derive(Debug, Clone)]
+pub struct HostToWorkerMessage {
+    pub event: String,
+    pub data: serde_json::Value,
+}
+
 /// V8's IsolateHandle is already Send + Sync and designed for cross-thread termination
 type IsolateHandle = deno_core::v8::IsolateHandle;
 
@@ -28,6 +35,8 @@ enum WorkerMessage {
         memory_limit_bytes: usize,
         response: tokio::sync::oneshot::Sender<Result<IsolateHandle, String>>,
         message_sender: mpsc::UnboundedSender<(usize, IsolateMessage)>,
+        /// Receiver for messages from host to this worker
+        host_message_receiver: mpsc::UnboundedReceiver<HostToWorkerMessage>,
     },
     /// Destroy an isolate on this thread
     DestroyIsolate { isolate_id: usize },
@@ -109,12 +118,17 @@ impl ThreadWorker {
                                 vlog_err!("Isolate #{} not found on thread {}", isolate_id, thread_id);
                             }
                         }
-                        WorkerMessage::CreateIsolate { isolate_id, memory_limit_bytes, response, message_sender } => {
+                        WorkerMessage::CreateIsolate { isolate_id, memory_limit_bytes, response, message_sender, host_message_receiver } => {
                             vlog!("Creating isolate #{} on thread {} (memory limit: {} MB)", isolate_id, thread_id, memory_limit_bytes / 1024 / 1024);
-                            let mut js_runtime = runtime::create_worker_runtime(isolate_id, message_sender.clone(), memory_limit_bytes);
+                            let mut js_runtime = runtime::create_worker_runtime(isolate_id, message_sender.clone(), host_message_receiver, memory_limit_bytes);
 
                             // Get the thread-safe handle which can be used to terminate from any thread
                             let handle = js_runtime.v8_isolate().thread_safe_handle();
+
+                            // Start the host message loop now that OpState is fully initialized
+                            if let Err(e) = js_runtime.execute_script("<start_message_loop>", "globalThis.__startHostMessageLoop && globalThis.__startHostMessageLoop() && (delete globalThis.__startHostMessagingLoop())") {
+                                vlog_err!("Failed to start message loop on isolate #{}: {:?}", isolate_id, e);
+                            }
 
                             // Exit the isolate after creation so it's not left as "current"
                             // It will be re-entered when needed for execution
@@ -203,12 +217,15 @@ impl CpuTimeTracker {
 
 /// Tracks which thread an isolate is assigned to
 struct IsolateInfo {
+    #[allow(dead_code)]
     isolate_id: usize,
     thread_id: usize,
     cpu_tracker: Arc<Mutex<CpuTimeTracker>>,
     terminated: AtomicBool,
     // Store the isolate handle for cross-thread termination
     isolate_handle: IsolateHandle,
+    // Channel for sending messages from host to this worker
+    host_message_sender: mpsc::UnboundedSender<HostToWorkerMessage>,
 }
 
 pub struct JsWorkerPool {
@@ -376,12 +393,16 @@ impl JsWorkerPool {
         // Create a oneshot channel for synchronization
         let (tx, rx) = tokio::sync::oneshot::channel();
 
+        // Create channel for host-to-worker messages
+        let (host_msg_tx, host_msg_rx) = mpsc::unbounded_channel();
+
         // Send create message to the selected thread
         self.thread_workers[thread_idx].send(WorkerMessage::CreateIsolate {
             isolate_id,
             memory_limit_bytes: self.default_memory_limit,
             response: tx,
             message_sender: self.message_sender.clone(),
+            host_message_receiver: host_msg_rx,
         });
 
         // Wait for the isolate to be created and get the handle
@@ -397,6 +418,7 @@ impl JsWorkerPool {
             cpu_tracker,
             terminated: AtomicBool::new(false),
             isolate_handle,
+            host_message_sender: host_msg_tx,
         };
         self.isolates.write().unwrap().insert(isolate_id, info);
 
@@ -437,6 +459,20 @@ impl JsWorkerPool {
             });
         } else {
             vlog_err!("Isolate #{} not found", isolate_id);
+        }
+    }
+
+    /// Send a message to a specific isolate (non-blocking, processed within event loop)
+    pub fn send_to_isolate(&self, isolate_id: usize, event: String, data: serde_json::Value) -> Result<(), String> {
+        let isolates = self.isolates.read().unwrap();
+
+        if let Some(info) = isolates.get(&isolate_id) {
+            info.host_message_sender
+                .send(HostToWorkerMessage { event, data })
+                .map_err(|e| format!("Failed to send message to isolate #{}: {}", isolate_id, e))?;
+            Ok(())
+        } else {
+            Err(format!("Isolate #{} not found", isolate_id))
         }
     }
 
