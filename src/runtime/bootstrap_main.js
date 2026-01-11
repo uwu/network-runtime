@@ -36,6 +36,9 @@ import * as io from "ext:deno_io/12_io.js";
 // Import Deno filesystem APIs
 import * as fs from "ext:deno_fs/30_fs.js";
 
+// Import Deno OS APIs
+import * as os from "ext:deno_os/30_os.js";
+
 // Import Deno WebSocket APIs
 import * as webSocket from "ext:deno_websocket/01_websocket.js";
 import * as websocketStream from "ext:deno_websocket/02_websocketstream.js";
@@ -164,8 +167,8 @@ BigInt.prototype.toJSON = function () {
 // V8Sandbox communication API
 const core = Deno.core;
 
-// Extend Deno namespace with fs, io, and net APIs
-Object.assign(Deno, fs, io, denoNet, denoTls);
+// Extend Deno namespace with fs, io, net, and OS APIs
+Object.assign(Deno, fs, io, denoNet, denoTls, os);
 
 // Add version info
 Deno.version = {

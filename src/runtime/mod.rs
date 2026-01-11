@@ -16,6 +16,7 @@ const BOOTSTRAP_MAIN_DEPS: &[&str] = &[
     "deno_net",
     "deno_io",
     "deno_fs",
+    "deno_os",
 ];
 
 // Bootstrap for worker isolates (minimal, no APIs)
@@ -159,6 +160,8 @@ pub fn create_privileged_runtime(pool: Rc<JsWorkerPool>) -> JsRuntime {
             // I/O and filesystem (after stub ops are registered)
             deno_io::deno_io::init(Some(deno_io::Stdio::default())),
             deno_fs::deno_fs::init(Rc::new(deno_fs::RealFs)),
+            // OS APIs
+            deno_os::deno_os::init(None),
             // Bootstrap (last)
             bootstrap_main_extension()
         ],
