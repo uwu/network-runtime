@@ -1,7 +1,9 @@
 mod transpile;
 use deno_core::{Extension, ExtensionFileSource, FsModuleLoader, JsRuntime, RuntimeOptions};
+use deno_permissions::{PermissionsContainer, RuntimePermissionDescriptorParser};
 use std::{borrow::Cow, rc::Rc, sync::Arc};
 use crate::pool::JsWorkerPool;
+use sys_traits::impls::RealSys;
 
 // Bootstrap for main/privileged runtime (with web APIs, crypto, and fetch)
 const BOOTSTRAP_MAIN_SPECIFIER: &str = "ext:bootstrap_main/bootstrap.js";
@@ -127,6 +129,9 @@ pub fn create_privileged_runtime(pool: Rc<JsWorkerPool>) -> JsRuntime {
     // Create FsModuleLoader with current directory as base
     let module_loader = Rc::new(FsModuleLoader);
 
+    let permissions =
+        PermissionsContainer::allow_all(Arc::new(RuntimePermissionDescriptorParser::new(RealSys)));
+
     // Extensions must be in dependency order
     let runtime = JsRuntime::new(RuntimeOptions {
         extensions: vec![
@@ -161,6 +166,8 @@ pub fn create_privileged_runtime(pool: Rc<JsWorkerPool>) -> JsRuntime {
         ..Default::default()
     });
 
+    runtime.op_state().borrow_mut().put(permissions);
+    
     // Store the pool in the OpState so ops can access it
     runtime.op_state().borrow_mut().put(pool);
 

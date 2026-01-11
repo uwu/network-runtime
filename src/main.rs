@@ -9,6 +9,11 @@ use std::rc::Rc;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Install rustls crypto provider before any TLS operations
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install default crypto provider");
+
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 

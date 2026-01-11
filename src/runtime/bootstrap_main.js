@@ -37,7 +37,7 @@ import * as io from "ext:deno_io/12_io.js";
 import * as fs from "ext:deno_fs/30_fs.js";
 
 // Import Deno WebSocket APIs
-import * as websocket from "ext:deno_websocket/01_websocket.js";
+import * as webSocket from "ext:deno_websocket/01_websocket.js";
 import * as websocketStream from "ext:deno_websocket/02_websocketstream.js";
 
 // Import Deno fetch APIs
@@ -142,6 +142,9 @@ const globalProperties = [
   { name: "Response", value: response.Response, enumerable: false, configurable: true, writable: true },
   { name: "fetch", value: fetch.fetch, enumerable: true, configurable: true, writable: true },
   { name: "EventSource", value: eventSource.EventSource, enumerable: false, configurable: true, writable: true },
+
+  // WebSocket APIs
+  { name: "WebSocket", value: webSocket.WebSocket, enumerable: false, configurable: true, writable: true },
 ];
 
 for (const prop of globalProperties) {
