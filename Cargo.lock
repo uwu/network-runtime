@@ -2597,6 +2597,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sys_traits",
+ "thiserror 2.0.17",
  "tokio",
 ]
 

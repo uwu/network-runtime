@@ -50,7 +50,7 @@ pub fn op_sandbox_execute(
         state_borrow.borrow::<Rc<JsWorkerPool>>().clone()
     };
 
-    pool.execute(isolate_id, script);
+    pool.execute_fire_and_forget(isolate_id, script);
 }
 
 #[op2(fast)]

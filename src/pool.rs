@@ -1,15 +1,67 @@
-use deno_core::JsRuntime;
-use std::collections::HashMap;
+use deno_core::{JsRuntime, PollEventLoopOptions, error::AnyError};
+use std::collections::{BinaryHeap, HashMap};
+use std::cmp::Ordering as CmpOrdering;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::runtime::Builder;
+use tokio::time::timeout;
 
 use crate::runtime;
 use crate::ops::sandbox::{IsolateMessage, SystemEvent};
 use crate::{vlog, vlog_err};
+
+/// Grace period for V8 isolate termination cleanup (matches Flora's approach)
+const TERMINATION_GRACE_MS: u64 = 100;
+
+/// Configuration for runtime limits (inspired by Flora's RuntimeLimits)
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeLimits {
+    /// Timeout for script execution (0 = no limit)
+    pub execution_timeout: Option<Duration>,
+    /// Timeout for event loop processing (0 = no limit)
+    pub event_loop_timeout: Option<Duration>,
+    /// Memory limit in bytes (0 = no limit)
+    pub memory_limit_bytes: usize,
+}
+
+impl RuntimeLimits {
+    /// Create new runtime limits from millisecond values
+    pub fn new(execution_timeout_ms: u64, memory_limit_mb: usize) -> Self {
+        Self {
+            execution_timeout: timeout_from_ms(execution_timeout_ms),
+            event_loop_timeout: timeout_from_ms(execution_timeout_ms),
+            memory_limit_bytes: memory_limit_mb * 1024 * 1024,
+        }
+    }
+
+    /// Create limits with no restrictions
+    pub fn unlimited() -> Self {
+        Self {
+            execution_timeout: None,
+            event_loop_timeout: None,
+            memory_limit_bytes: 0,
+        }
+    }
+}
+
+fn timeout_from_ms(ms: u64) -> Option<Duration> {
+    if ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(ms))
+    }
+}
+
+/// Error type for runtime timeouts
+#[derive(Debug, thiserror::Error)]
+#[error("{stage} timed out")]
+pub struct RuntimeTimeout {
+    pub stage: &'static str,
+}
 
 /// Message sent from host to worker isolate
 #[derive(Debug, Clone)]
@@ -21,13 +73,186 @@ pub struct HostToWorkerMessage {
 /// V8's IsolateHandle is already Send + Sync and designed for cross-thread termination
 type IsolateHandle = deno_core::v8::IsolateHandle;
 
+// ============================================================================
+// Timeout Manager - single thread that handles all timeout terminations
+// ============================================================================
+
+/// Entry in the timeout queue
+struct TimeoutEntry {
+    deadline: Instant,
+    isolate_id: usize,
+    execution_id: usize,
+    handle: IsolateHandle,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl PartialEq for TimeoutEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.execution_id == other.execution_id
+    }
+}
+
+impl Eq for TimeoutEntry {}
+
+impl PartialOrd for TimeoutEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimeoutEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // Reverse ordering for min-heap (earliest deadline first)
+        other.deadline.cmp(&self.deadline)
+    }
+}
+
+/// Handle returned when registering a timeout, used to cancel it
+pub struct TimeoutHandle {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl TimeoutHandle {
+    /// Cancel this timeout (call when execution completes normally)
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for TimeoutHandle {
+    fn drop(&mut self) {
+        // Auto-cancel on drop
+        self.cancel();
+    }
+}
+
+/// Manages timeouts for all isolate executions
+struct TimeoutManager {
+    queue: Mutex<BinaryHeap<TimeoutEntry>>,
+    condvar: Condvar,
+    next_execution_id: AtomicUsize,
+    stop_flag: AtomicBool,
+}
+
+impl TimeoutManager {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queue: Mutex::new(BinaryHeap::new()),
+            condvar: Condvar::new(),
+            next_execution_id: AtomicUsize::new(0),
+            stop_flag: AtomicBool::new(false),
+        })
+    }
+
+    /// Register a timeout for an isolate execution
+    fn register(
+        &self,
+        isolate_id: usize,
+        handle: IsolateHandle,
+        timeout_duration: Duration,
+    ) -> TimeoutHandle {
+        let execution_id = self.next_execution_id.fetch_add(1, Ordering::Relaxed);
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let entry = TimeoutEntry {
+            deadline: Instant::now() + timeout_duration,
+            isolate_id,
+            execution_id,
+            handle,
+            cancelled: Arc::clone(&cancelled),
+        };
+
+        {
+            let mut queue = self.queue.lock().unwrap();
+            queue.push(entry);
+        }
+
+        // Wake up the timeout thread
+        self.condvar.notify_one();
+
+        TimeoutHandle { cancelled }
+    }
+
+    /// Stop the timeout manager
+    fn stop(&self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        self.condvar.notify_one();
+    }
+
+    /// Run the timeout manager loop (call from dedicated thread)
+    fn run(&self) {
+        vlog!("Timeout manager thread started");
+
+        loop {
+            let mut queue = self.queue.lock().unwrap();
+
+            // Check for shutdown
+            if self.stop_flag.load(Ordering::Relaxed) {
+                vlog!("Timeout manager shutting down");
+                break;
+            }
+
+            // Determine how long to wait
+            if let Some(entry) = queue.peek() {
+                let now = Instant::now();
+                if entry.deadline > now {
+                    // Wait until deadline or new entry
+                    let wait_duration = entry.deadline - now;
+                    let (new_queue, _) = self.condvar.wait_timeout(queue, wait_duration).unwrap();
+                    queue = new_queue;
+                }
+                // If deadline <= now, fall through to process immediately
+            } else {
+                // No entries, wait indefinitely for new ones
+                queue = self.condvar.wait(queue).unwrap();
+                continue; // Re-check after waking
+            }
+
+            // Check for shutdown again after waking
+            if self.stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Process all expired entries
+            let now = Instant::now();
+            while let Some(entry) = queue.peek() {
+                if entry.deadline > now {
+                    break; // No more expired entries
+                }
+
+                let entry = queue.pop().unwrap();
+
+                // Skip if cancelled
+                if entry.cancelled.load(Ordering::Relaxed) {
+                    continue;
+                }
+
+                // Terminate the isolate
+                vlog_err!(
+                    "Isolate #{} execution timed out, terminating...",
+                    entry.isolate_id
+                );
+                entry.handle.terminate_execution();
+            }
+        }
+
+        vlog!("Timeout manager thread stopped");
+    }
+}
+
+// ============================================================================
+// Worker Messages and Thread Workers
+// ============================================================================
+
 /// Messages sent to worker threads
 enum WorkerMessage {
-    /// Execute script on a specific isolate
+    /// Execute script on a specific isolate with timeout-based limiting
     Execute {
         isolate_id: usize,
         script: String,
-        cpu_tracker: Arc<Mutex<CpuTimeTracker>>,
+        limits: RuntimeLimits,
+        /// Channel to report execution result/errors
+        result_sender: tokio::sync::oneshot::Sender<Result<(), ExecutionError>>,
     },
     /// Create a new isolate on this thread
     CreateIsolate {
@@ -44,6 +269,19 @@ enum WorkerMessage {
     Shutdown,
 }
 
+/// Errors that can occur during script execution
+#[derive(Debug)]
+pub enum ExecutionError {
+    /// Execution timed out
+    Timeout { stage: &'static str },
+    /// Isolate not found
+    IsolateNotFound(usize),
+    /// Script execution error
+    ScriptError(String),
+    /// Execution was terminated
+    Terminated,
+}
+
 /// A worker thread that manages multiple V8 isolates
 struct ThreadWorker {
     thread_id: usize,
@@ -51,7 +289,7 @@ struct ThreadWorker {
 }
 
 impl ThreadWorker {
-    fn new(thread_id: usize) -> Self {
+    fn new(thread_id: usize, timeout_manager: Arc<TimeoutManager>) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<WorkerMessage>();
 
         thread::spawn(move || {
@@ -68,55 +306,23 @@ impl ThreadWorker {
 
                 while let Some(msg) = rx.recv().await {
                     match msg {
-                        WorkerMessage::Execute { isolate_id, script, cpu_tracker } => {
-                            if let Some(js_runtime) = isolates.get_mut(&isolate_id) {
-                                // Start CPU time tracking
-                                cpu_tracker.lock().unwrap().start();
-
-                                // Enter the isolate to set it as current in V8's thread-local storage
-                                unsafe {
-                                    js_runtime.v8_isolate().enter();
-                                }
-
+                        WorkerMessage::Execute { isolate_id, script, limits, result_sender } => {
+                            let result = if let Some(js_runtime) = isolates.get_mut(&isolate_id) {
                                 vlog!("Starting script execution on isolate #{}", isolate_id);
-                                match js_runtime.execute_script("<pool_job>", script) {
-                                    Ok(_) => {
-                                        // Check if isolate is being terminated before running event loop
-                                        if js_runtime.v8_isolate().is_execution_terminating() {
-                                            vlog!("Isolate #{} execution was terminated during script", isolate_id);
-                                        } else if let Err(e) = js_runtime.run_event_loop(Default::default()).await {
-                                            // Check if this is a termination error
-                                            let error_str = format!("{:?}", e);
-                                            if error_str.contains("execution terminated") || error_str.contains("Uncatchable") {
-                                                vlog!("Isolate #{} execution was terminated", isolate_id);
-                                            } else {
-                                                vlog_err!("Error running event loop on isolate #{}: {:?}", isolate_id, e);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // Check if this is a termination error
-                                        let error_str = format!("{:?}", e);
-                                        if error_str.contains("execution terminated") || error_str.contains("Uncatchable") {
-                                            vlog!("Isolate #{} execution was terminated", isolate_id);
-                                        } else {
-                                            vlog_err!("Error executing script on isolate #{}: {:?}", isolate_id, e);
-                                        }
-                                    }
-                                }
-
-                                // Exit the isolate when done
-                                unsafe {
-                                    js_runtime.v8_isolate().exit();
-                                }
-
-                                // Stop CPU time tracking
-                                cpu_tracker.lock().unwrap().stop();
-
-                                vlog!("Finished executing on isolate #{}", isolate_id);
+                                execute_with_timeout(
+                                    js_runtime,
+                                    isolate_id,
+                                    script,
+                                    &limits,
+                                    &timeout_manager,
+                                ).await
                             } else {
                                 vlog_err!("Isolate #{} not found on thread {}", isolate_id, thread_id);
-                            }
+                                Err(ExecutionError::IsolateNotFound(isolate_id))
+                            };
+
+                            // Report result back
+                            let _ = result_sender.send(result);
                         }
                         WorkerMessage::CreateIsolate { isolate_id, memory_limit_bytes, response, message_sender, host_message_receiver } => {
                             vlog!("Creating isolate #{} on thread {} (memory limit: {} MB)", isolate_id, thread_id, memory_limit_bytes / 1024 / 1024);
@@ -178,51 +384,126 @@ impl ThreadWorker {
     }
 }
 
-/// Tracks CPU time usage for an isolate
-#[derive(Clone)]
-pub struct CpuTimeTracker {
-    start_time: Option<Instant>,
-    accumulated_time: Duration,
-    limit: Duration,
+// ============================================================================
+// Timeout-based execution functions
+// ============================================================================
+
+/// Execute a script with timeout-based resource limiting
+async fn execute_with_timeout(
+    js_runtime: &mut JsRuntime,
+    isolate_id: usize,
+    script: String,
+    limits: &RuntimeLimits,
+    timeout_manager: &TimeoutManager,
+) -> Result<(), ExecutionError> {
+    // Get the thread-safe handle for termination
+    let isolate_handle = js_runtime.v8_isolate().thread_safe_handle();
+
+    // Enter the isolate to set it as current in V8's thread-local storage
+    unsafe {
+        js_runtime.v8_isolate().enter();
+    }
+
+    // Register timeout with the manager if configured
+    let _timeout_handle = limits.execution_timeout.map(|duration| {
+        timeout_manager.register(isolate_id, isolate_handle.clone(), duration)
+    });
+
+    let result = execute_inner(js_runtime, isolate_id, script).await;
+
+    // Timeout handle is automatically cancelled when dropped
+
+    // If we were terminated by timeout, do graceful cleanup
+    if js_runtime.v8_isolate().is_execution_terminating() {
+        // Give a grace period for cleanup
+        let _ = timeout(
+            Duration::from_millis(TERMINATION_GRACE_MS),
+            js_runtime.run_event_loop(PollEventLoopOptions::default()),
+        )
+        .await;
+
+        // Cancel termination so isolate can be reused
+        js_runtime.v8_isolate().cancel_terminate_execution();
+    }
+
+    // Exit the isolate when done
+    unsafe {
+        js_runtime.v8_isolate().exit();
+    }
+
+    vlog!("Finished executing on isolate #{}", isolate_id);
+    result
 }
 
-impl CpuTimeTracker {
-    pub fn new(limit: Duration) -> Self {
-        Self {
-            start_time: None,
-            accumulated_time: Duration::ZERO,
-            limit,
+async fn execute_inner(
+    js_runtime: &mut JsRuntime,
+    isolate_id: usize,
+    script: String,
+) -> Result<(), ExecutionError> {
+    // Execute the script
+    match js_runtime.execute_script("<pool_job>", script) {
+        Ok(_) => {
+            // Check if isolate is being terminated before running event loop
+            if js_runtime.v8_isolate().is_execution_terminating() {
+                vlog!("Isolate #{} execution was terminated during script", isolate_id);
+                return Err(ExecutionError::Terminated);
+            }
+
+            // Run event loop
+            match js_runtime.run_event_loop(PollEventLoopOptions::default()).await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let error_str = format!("{:?}", e);
+                    if error_str.contains("execution terminated") || error_str.contains("Uncatchable") {
+                        vlog!("Isolate #{} execution was terminated", isolate_id);
+                        Err(ExecutionError::Terminated)
+                    } else {
+                        vlog_err!("Isolate #{} event loop error: {:?}", isolate_id, e);
+                        Err(ExecutionError::ScriptError(error_str))
+                    }
+                }
+            }
         }
-    }
-
-    pub fn start(&mut self) {
-        self.start_time = Some(Instant::now());
-    }
-
-    pub fn stop(&mut self) {
-        if let Some(start) = self.start_time.take() {
-            self.accumulated_time += start.elapsed();
+        Err(e) => {
+            let error_str = format!("{:?}", e);
+            if error_str.contains("execution terminated") || error_str.contains("Uncatchable") {
+                vlog!("Isolate #{} execution was terminated", isolate_id);
+                Err(ExecutionError::Terminated)
+            } else {
+                vlog_err!("Error executing script on isolate #{}: {:?}", isolate_id, e);
+                Err(ExecutionError::ScriptError(error_str))
+            }
         }
-    }
-
-    pub fn total_time(&self) -> Duration {
-        let current_run = self.start_time.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
-        self.accumulated_time + current_run
-    }
-
-    pub fn is_over_limit(&self) -> bool {
-        self.total_time() > self.limit
     }
 }
+
+/// Generic timeout wrapper for async operations (matches Flora's with_timeout pattern)
+#[allow(dead_code)]
+async fn with_timeout<T>(
+    timeout_duration: Option<Duration>,
+    fut: impl Future<Output = Result<T, AnyError>>,
+    stage: &'static str,
+) -> Result<T, AnyError> {
+    match timeout_duration {
+        Some(duration) => match timeout(duration, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(AnyError::from(RuntimeTimeout { stage })),
+        },
+        None => fut.await,
+    }
+}
+
+// ============================================================================
+// Isolate tracking and pool management
+// ============================================================================
 
 /// Tracks which thread an isolate is assigned to
 struct IsolateInfo {
     #[allow(dead_code)]
     isolate_id: usize,
     thread_id: usize,
-    cpu_tracker: Arc<Mutex<CpuTimeTracker>>,
-    terminated: AtomicBool,
-    // Store the isolate handle for cross-thread termination
+    // Store the isolate handle for cross-thread termination if needed
+    #[allow(dead_code)]
     isolate_handle: IsolateHandle,
     // Channel for sending messages from host to this worker
     host_message_sender: mpsc::UnboundedSender<HostToWorkerMessage>,
@@ -237,149 +518,59 @@ pub struct JsWorkerPool {
     next_isolate_id: AtomicUsize,
     /// Round-robin counter for thread selection
     next_thread_idx: AtomicUsize,
-    /// Default CPU time limit for new isolates
-    default_cpu_limit: Duration,
-    /// Default memory limit for new isolates (in bytes)
-    default_memory_limit: usize,
-    /// Flag to stop the watcher thread
-    watcher_stop: Arc<AtomicBool>,
+    /// Default runtime limits for new isolates
+    default_limits: RuntimeLimits,
     /// Channel sender for worker->main messages
     message_sender: mpsc::UnboundedSender<(usize, IsolateMessage)>,
     /// Channel sender for system events
     system_event_sender: mpsc::UnboundedSender<SystemEvent>,
+    /// Timeout manager for all isolates
+    timeout_manager: Arc<TimeoutManager>,
 }
 
 impl JsWorkerPool {
-    /// Create a new pool with the specified number of threads, CPU time limit, and memory limit
+    /// Create a new pool with the specified number of threads and runtime limits
     /// Returns (pool, message_receiver, system_event_receiver)
     ///
     /// # Arguments
     /// * `thread_count` - Number of worker threads
-    /// * `cpu_limit` - CPU time limit per isolate
-    /// * `memory_limit_mb` - Memory limit per isolate in megabytes (0 = no limit)
-    pub fn new(thread_count: usize, cpu_limit: Duration, memory_limit_mb: usize) -> (Self, mpsc::UnboundedReceiver<(usize, IsolateMessage)>, mpsc::UnboundedReceiver<SystemEvent>) {
+    /// * `limits` - Runtime limits (timeouts and memory) for isolates
+    pub fn new(thread_count: usize, limits: RuntimeLimits) -> (Self, mpsc::UnboundedReceiver<(usize, IsolateMessage)>, mpsc::UnboundedReceiver<SystemEvent>) {
         let thread_count = thread_count.max(1);
 
+        // Create the shared timeout manager
+        let timeout_manager = TimeoutManager::new();
+
+        // Start the timeout manager thread
+        let tm_clone = Arc::clone(&timeout_manager);
+        thread::spawn(move || {
+            tm_clone.run();
+        });
+
         let thread_workers: Vec<ThreadWorker> = (0..thread_count)
-            .map(|i| ThreadWorker::new(i))
+            .map(|i| ThreadWorker::new(i, Arc::clone(&timeout_manager)))
             .collect();
 
         let isolates = Arc::new(RwLock::new(HashMap::new()));
-        let watcher_stop = Arc::new(AtomicBool::new(false));
-
-        // Create a shared reference to thread workers for the watcher
-        let workers_for_watcher: Vec<mpsc::UnboundedSender<WorkerMessage>> =
-            thread_workers.iter().map(|w| w.sender.clone()).collect();
 
         // Create channels for messaging
         let (message_sender, message_receiver) = mpsc::unbounded_channel();
         let (system_event_sender, system_event_receiver) = mpsc::unbounded_channel();
 
-        // Start the watcher thread
-        Self::start_watcher(
-            Arc::clone(&isolates),
-            Arc::clone(&watcher_stop),
-            workers_for_watcher,
-            system_event_sender.clone(),
-        );
+        vlog!("Worker pool created with {} threads, limits: {:?}", thread_count, limits);
 
         let pool = JsWorkerPool {
             thread_workers,
             isolates,
             next_isolate_id: AtomicUsize::new(0),
             next_thread_idx: AtomicUsize::new(0),
-            default_cpu_limit: cpu_limit,
-            default_memory_limit: memory_limit_mb * 1024 * 1024, // Convert MB to bytes
-            watcher_stop,
+            default_limits: limits,
             message_sender,
             system_event_sender,
+            timeout_manager,
         };
 
         (pool, message_receiver, system_event_receiver)
-    }
-
-    /// Start the CPU time watcher thread
-    fn start_watcher(
-        isolates: Arc<RwLock<HashMap<usize, IsolateInfo>>>,
-        stop_flag: Arc<AtomicBool>,
-        workers: Vec<mpsc::UnboundedSender<WorkerMessage>>,
-        system_event_sender: mpsc::UnboundedSender<SystemEvent>,
-    ) {
-        thread::spawn(move || {
-            vlog!("CPU Watcher thread started");
-
-            while !stop_flag.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(100));
-
-                // Collect isolates that need to be terminated
-                let to_terminate: Vec<(usize, usize)> = {
-                    let isolates_lock = isolates.read().unwrap();
-
-                    isolates_lock.iter()
-                        .filter_map(|(isolate_id, info)| {
-                            let tracker = info.cpu_tracker.lock().unwrap();
-
-                            if tracker.is_over_limit() && !info.terminated.load(Ordering::Relaxed) {
-                                let total = tracker.total_time();
-                                let limit = tracker.limit;
-                                vlog_err!(
-                                    "Isolate #{} exceeded CPU limit: {:?} > {:?}",
-                                    isolate_id, total, limit
-                                );
-
-                                Some((*isolate_id, info.thread_id))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                };
-
-                // Terminate and clean up each violating isolate
-                for (isolate_id, _thread_id) in to_terminate {
-                    // Get the isolate handle for termination
-                    let isolate_handle = {
-                        let isolates_lock = isolates.read().unwrap();
-                        if let Some(info) = isolates_lock.get(&isolate_id) {
-                            // Mark as terminated first
-                            info.terminated.store(true, Ordering::Relaxed);
-                            Some(info.isolate_handle.clone())
-                        } else {
-                            None
-                        }
-                    };
-
-                    // Actually terminate the V8 isolate execution
-                    // IsolateHandle::terminate_execution is thread-safe and designed for this
-                    if let Some(handle) = isolate_handle {
-                        if handle.terminate_execution() {
-                            vlog!("Terminated execution for isolate #{}", isolate_id);
-                        } else {
-                            vlog_err!("Failed to terminate isolate #{} (may already be terminated)", isolate_id);
-                        }
-                    }
-
-                    // Remove from tracking HashMap
-                    // This prevents new work from being sent to this isolate
-                    {
-                        let mut isolates_lock = isolates.write().unwrap();
-                        isolates_lock.remove(&isolate_id);
-                        vlog!("Removed isolate #{} from tracking", isolate_id);
-                    }
-
-                    // Send system event for termination
-                    let _ = system_event_sender.send(SystemEvent {
-                        event_type: "terminated".to_string(),
-                        isolate_id,
-                        data: serde_json::json!({
-                            "reason": "cpu_limit_exceeded"
-                        }),
-                    });
-                }
-            }
-
-            vlog!("CPU Watcher thread stopped");
-        });
     }
 
     /// Create a new isolate and return its ID
@@ -399,7 +590,7 @@ impl JsWorkerPool {
         // Send create message to the selected thread
         self.thread_workers[thread_idx].send(WorkerMessage::CreateIsolate {
             isolate_id,
-            memory_limit_bytes: self.default_memory_limit,
+            memory_limit_bytes: self.default_limits.memory_limit_bytes,
             response: tx,
             message_sender: self.message_sender.clone(),
             host_message_receiver: host_msg_rx,
@@ -408,15 +599,10 @@ impl JsWorkerPool {
         // Wait for the isolate to be created and get the handle
         let isolate_handle = rx.await.map_err(|_| "Failed to create isolate".to_string())??;
 
-        // Create CPU time tracker for this isolate
-        let cpu_tracker = Arc::new(Mutex::new(CpuTimeTracker::new(self.default_cpu_limit)));
-
         // Track the isolate
         let info = IsolateInfo {
             isolate_id,
             thread_id: thread_idx,
-            cpu_tracker,
-            terminated: AtomicBool::new(false),
             isolate_handle,
             host_message_sender: host_msg_tx,
         };
@@ -447,19 +633,29 @@ impl JsWorkerPool {
         }
     }
 
-    /// Execute a script on a specific isolate
-    pub fn execute(&self, isolate_id: usize, script: impl Into<String>) {
+    /// Execute a script on a specific isolate with timeout-based resource limiting
+    /// Returns a receiver for the execution result
+    pub fn execute(&self, isolate_id: usize, script: impl Into<String>) -> Option<tokio::sync::oneshot::Receiver<Result<(), ExecutionError>>> {
         let isolates = self.isolates.read().unwrap();
 
         if let Some(info) = isolates.get(&isolate_id) {
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
             self.thread_workers[info.thread_id].send(WorkerMessage::Execute {
                 isolate_id,
                 script: script.into(),
-                cpu_tracker: Arc::clone(&info.cpu_tracker),
+                limits: self.default_limits,
+                result_sender: result_tx,
             });
+            Some(result_rx)
         } else {
             vlog_err!("Isolate #{} not found", isolate_id);
+            None
         }
+    }
+
+    /// Execute a script on a specific isolate (fire-and-forget version)
+    pub fn execute_fire_and_forget(&self, isolate_id: usize, script: impl Into<String>) {
+        let _ = self.execute(isolate_id, script);
     }
 
     /// Send a message to a specific isolate (non-blocking, processed within event loop)
@@ -489,12 +685,19 @@ impl JsWorkerPool {
 
     /// Shutdown all threads
     pub fn shutdown(&self) {
-        // Stop the watcher thread first
-        self.watcher_stop.store(true, Ordering::Relaxed);
+        vlog!("Shutting down worker pool...");
+
+        // Stop the timeout manager first
+        self.timeout_manager.stop();
 
         // Then shutdown worker threads
         for worker in &self.thread_workers {
             worker.send(WorkerMessage::Shutdown);
         }
+    }
+
+    /// Get the current runtime limits
+    pub fn limits(&self) -> RuntimeLimits {
+        self.default_limits
     }
 }

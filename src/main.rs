@@ -3,8 +3,7 @@ mod pool;
 mod ops;
 mod log;
 
-use pool::JsWorkerPool;
-use std::time::Duration;
+use pool::{JsWorkerPool, RuntimeLimits};
 use std::rc::Rc;
 
 #[tokio::main(flavor = "current_thread")]
@@ -25,11 +24,11 @@ async fn main() {
     let args: Vec<String> = args.into_iter().filter(|arg| arg != "--verbose" && arg != "-v").collect();
 
     if args.len() < 2 {
-        alog_err!("Usage: {} <script.js> [thread_count] [cpu_limit_ms] [memory_limit_mb] [--verbose|-v]", args[0]);
+        alog_err!("Usage: {} <script.js> [thread_count] [timeout_ms] [memory_limit_mb] [--verbose|-v]", args[0]);
         alog_err!("\nExample: {} main.js 2 500 128", args[0]);
         alog_err!("         {} main.js 4 1000 256 --verbose", args[0]);
         alog_err!("\n  thread_count:   Number of worker threads (default: 2)");
-        alog_err!("  cpu_limit_ms:   CPU time limit per isolate in ms (default: 500)");
+        alog_err!("  timeout_ms:     Execution timeout per script in ms (default: 500, 0 = unlimited)");
         alog_err!("  memory_limit_mb: Memory limit per isolate in MB (default: 0 = no limit)");
         std::process::exit(1);
     }
@@ -38,21 +37,24 @@ async fn main() {
     let thread_count = args.get(2)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(2);
-    let cpu_limit_ms = args.get(3)
+    let timeout_ms = args.get(3)
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(500);
     let memory_limit_mb = args.get(4)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
 
+    // Create runtime limits (Flora-inspired timeout-based limiting)
+    let limits = RuntimeLimits::new(timeout_ms, memory_limit_mb);
+
     vlog!("=== V8 Sandbox Runtime ===");
     vlog!("Script: {}", script_path);
     vlog!("Threads: {}", thread_count);
-    vlog!("CPU Limit: {}ms per isolate", cpu_limit_ms);
+    vlog!("Execution Timeout: {}", if timeout_ms == 0 { "unlimited".to_string() } else { format!("{}ms", timeout_ms) });
     vlog!("Memory Limit: {}\n", if memory_limit_mb == 0 { "unlimited".to_string() } else { format!("{} MB", memory_limit_mb) });
 
-    // Create the worker pool and get channel receivers
-    let (pool, message_receiver, system_event_receiver) = JsWorkerPool::new(thread_count, Duration::from_millis(cpu_limit_ms), memory_limit_mb);
+    // Create the worker pool with timeout-based resource limiting
+    let (pool, message_receiver, system_event_receiver) = JsWorkerPool::new(thread_count, limits);
     let pool = Rc::new(pool);
 
     // Create the privileged main isolate with sandbox ops
